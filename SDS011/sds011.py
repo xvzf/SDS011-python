@@ -10,17 +10,20 @@
 from serial import Serial
 from binascii import hexlify, unhexlify
 from struct import unpack, pack
-import unittest
+import time
+# import asyncio # @TODO
 
 class PacketParseException(Exception):
     pass
 
 class Sds011(object):
     """
-    @TODO
+    Python library for the nova PM SDS011 dust sensor
     """
     
     baud = 9600 # 9600B8N1
+    outgoing_cmd = 0xB4
+    incoming_cmd = 0xC4
 
 
     def __init__(self, port):
@@ -36,9 +39,25 @@ class Sds011(object):
         """
         Initializes the serial connection
         """
-        print(self.port)
-        print("@TODO")
+        self.conn = Serial(self.port, self.baud)
     
+
+    def request(self, bytestring: bytes) -> bytes:
+        """
+        Send request to the sensor
+
+        :param bytestring: Packet which should be send
+        :return: Response
+        """
+        self.conn.reset_input_buffer() # Default mode is active reporting, just to make sure
+ 
+        self.conn.write(bytestring)
+ 
+        while self.conn.in_waiting < 10:
+            time.sleep(0.05)
+        
+        return self.conn.read(10)
+   
 
     def extract_data_from_incoming_packet(self, packet: bytes, unpack_scheme="<BHHHB") -> dict:
         """
@@ -53,7 +72,6 @@ class Sds011(object):
             raise PacketParseException("No matching tags")
 
         try:
-            print(packet[1:-2])
             tmp = list(unpack(unpack_scheme, packet[1:-1]))
         except:
             raise PacketParseException("Bytestream mismatch")
@@ -89,6 +107,43 @@ class Sds011(object):
 
         return packet
     
+
+    def build_packet_basic(self, data: list, ID=None) -> bytes:
+        """
+        Builds a packet using just the first n data bytes and the ID
+
+        :param data: Data bytes (up to 13)
+        :param ID: If only one sensor should be adressed, pass its ID here
+        :return: packet bytestring
+        """
+
+        # Data bytes, 0 byte padding, ID
+        data = [b for b in data] + [0] * (13 - len(data)) + Sds011.get_ID_bytes(ID)
+
+        packetdict = {
+            "cmd":  self.outgoing_cmd,
+            "data": data
+        }
+
+        return self.build_packet(packetdict)
+    
+    
+    @staticmethod
+    def get_ID_bytes(ID=None) -> list:
+        """
+        Splits the ID into two bytes
+
+        :param ID: 16-bit ID
+        :return: two 8 bit values
+        """
+        ID0, ID1 = 0xFF, 0xFF
+
+        if ID: # Specific ID required
+            ID1, ID0 = (ID & 0xFF00) >> 8, ID & 0xFF
+        
+        return [ID0, ID1]
+
+
     
     @staticmethod
     def checksum_incoming(packet: bytes) -> int:
@@ -128,57 +183,110 @@ class Sds011(object):
         return checksum
 
 
-    def set_report_mode(self, data, id=None):
+    def set_report_mode(self, data, ID=None):
         """
         Sets the sensor reporting mode
 
-        :param data: Data which should be set (first two data bytes)
-        :id: Sensor ID, None for all sensors
+        :param data: Data which should be set (two data bytes)
+        :param ID: If only one sensor should be adressed, pass its ID here
         :return: Action successfull
         """
-        id0, id1 = 0xFF, 0xFF # Set all sensors
-
-        if id: # Specif ID required
-            id0, id1 = id & 0xFF00, id & 0x00FF
-
-        packetdict = {
-            "cmd":  0xB4,
-            # 2 is fixed, 1 for reporting mode, 1 for query mode, 0...., ID
-            "data": [2, data[0], data[1], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, id0, id1]
-        }
-
-        request = self.build_packet(packetdict)
-        print(request)
-        # @TODO
+        request = self.build_packet_basic( [2] + data, ID)
+        response = self.request(request)
+        # @TODO Check response
         return True
     
 
-    def set_report_query_mode(self, id=None) -> bool:
+    def set_report_query_mode(self, ID=None) -> bool:
         """
-        Sets the sensor in reporting active mode, i.e. the sensor transmits measuring data when it is queried
+        Changes the sensor reporting mode
 
-        :id: If only one Sensor ID should be set; leave default to set all sensors
+        :param ID: If only one sensor should be adressed, pass its ID here
         :return: Action successfull
         """
 
-        return self.set_report_mode([1, 1], id)
+        return self.set_report_mode([1, 1], ID)
     
 
-    def set_report_active_mode(self, id=None) -> bool:
+    def set_report_active_mode(self, ID=None) -> bool:
         """
+        @NOTRECOMMENDED !!!
         Sets the sensor in reporting active mode, i.e. the sensor transmits measuring data without a query
 
-        :id: If only one Sensor ID should be set; leave default to set all sensors
+        :param ID: If only one sensor should be adressed, pass its ID here
         :return: Action successfull
         """
 
-        return self.set_report_mode([1, 0], id)
-        
+        return self.set_report_mode([1, 0], ID)
+    
 
-if __name__ == "__main__":
-    s = Sds011("")
-    print(s.extract_data_from_incoming_packet(b"\xAA\xC0\xD4\x04\x3A\x0A\xA1\x60\x1D\xAB"))
-    print("===================")
-    s.set_report_active_mode()
-    print("===================")
-    s.set_report_query_mode()
+    def set_new_device_ID(self, newID: int, ID=None) -> bool:
+        """
+        Sets a new device ID (16-bit)
+
+        :param newID: New device ID
+        :param ID: If only one sensor should be adressed, pass its ID here
+        :return: Action successfull
+        """
+
+        # 5 for ID change, 0.. , old ID, new ID
+        request = self.build_packet_basic( [5] + [0] * 10 + Sds011.get_ID_bytes(newID))
+        response = self.request(request)
+        # @TODO check response
+        return True
+    
+
+    def set_sleep_work_mode(self, data: list, ID=None) -> bool:
+        """
+        Changes the sensors operating mode
+
+        :param data: Data which should be set (two data bytes)
+        :param ID: If only one sensor should be adressed, pass its ID here
+        :return: Action successfull
+        """
+        request = self.build_packet_basic([6] + data, ID)
+        response = self.request(request)
+        # @TODO Check response
+        print(response)
+        return True
+    
+
+    def set_sleep_mode(self, ID=None) -> bool:
+        """
+        Changes the sensors operating mode to sleep
+
+        :param ID: If only one sensor should be adressed, pass its ID here
+        :return: Actuon successfull
+        """
+        self.set_sleep_work_mode([1, 0], ID)
+    
+
+    def set_work_mode(self, ID=None) -> bool:
+        """
+        Changes the sensors operating mode to sleep
+
+        :param ID: If only one sensor should be adressed, pass its ID here
+        :return: Actuon successfull
+        """
+        self.set_sleep_work_mode([1,1], ID)
+    
+
+    def query_data(self, ID=None) -> (float, float, int):
+        """
+        Queries the sensor and reports back PM2.5 and PM10
+
+        :param ID: If only one sensor should be adressed, pass its ID here
+        :return: PM2.5 and PM10 value additional the sensor ID
+        """
+        request = self.build_packet_basic([4], ID)
+        response = self.request(request)
+
+        data = [-1, -1, -1]
+
+        try:
+            data = self.extract_data_from_incoming_packet(response)["data"]
+        except PacketParseException:
+            print("Could not query, is the device in response query mode?")
+            pass
+
+        return (data[0] / 10.0, data[1] / 10.0, data[2])
